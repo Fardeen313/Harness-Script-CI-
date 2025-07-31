@@ -1,0 +1,54 @@
+template:
+  name: build
+  type: Stage
+  projectIdentifier: SAMPLE
+  orgIdentifier: default
+  spec:
+    type: CI
+    spec:
+      cloneCodebase: false
+      infrastructure:
+        type: KubernetesDirect
+        spec:
+          connectorRef: minikube
+          namespace: harness-delegate
+          automountServiceAccountToken: true
+          nodeSelector: {}
+          os: Linux
+      execution:
+        steps:
+          - step:
+              name: Clone CloudFormation Repo
+              identifier: clone_repo
+              type: GitClone
+              spec:
+                connectorRef: account.Gitconnectoradmin
+                repoName: CloudFormation
+                build:
+                  type: branch
+                  spec:
+                    branch: main
+          - step:
+              name: Deploy CF Template
+              identifier: deploy_cf_template
+              type: Run
+              spec:
+                connectorRef: account.Docker
+                image: amazon/aws-cli
+                shell: Sh
+                envVariables:
+                  AWS_ACCESS_KEY_ID: <+secrets.getValue("account.AWS_ACCESS_KEY_ID")>
+                  AWS_SECRET_ACCESS_KEY: <+secrets.getValue("account.AWS_SECRET_ACCESS_KEY")>
+                  AWS_DEFAULT_REGION: us-east-1
+                command: |-
+                  # Navigate into the cloned repo directory
+                  cd CloudFormation
+
+                  # Deploy the CloudFormation template
+                  aws cloudformation deploy \
+                    --template-file s3-bucket.yml \
+                    --stack-name my-s3-stack \
+                    --region us-east-1 \
+                    --capabilities CAPABILITY_NAMED_IAM
+  versionLabel: version01
+  identifier: build
