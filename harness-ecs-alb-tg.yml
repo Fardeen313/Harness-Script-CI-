@@ -1,0 +1,306 @@
+pipeline:
+  name: cloudformation-pipeline-alb-stack
+  identifier: cloudformation_pipeline_Clone
+  projectIdentifier: SAMPLE
+  orgIdentifier: default
+  tags: {}
+  properties:
+    ci:
+      codebase:
+        connectorRef: account.Gitconnectoradmin
+        repoName: CloudFormation
+        build: <+input>
+  variables:
+    - name: AWS_DEFAULT_REGION
+      type: String
+      required: true
+      value: <+input>
+    - name: VPC_ID
+      type: String
+      required: true
+      value: <+input>
+    - name: SUBNET_IDS
+      type: String
+      required: true
+      value: <+input>
+    - name: ALB_SG_ID
+      type: String
+      required: true
+      value: <+input>
+    - name: TASK_IMAGE
+      type: String
+      required: true
+      value: <+input>
+    - name: CREATE_SERVICE
+      type: String
+      required: true
+      value: <+input>
+  stages:
+    - stage:
+        name: CreateTargetGroup
+        identifier: CreateTargetGroup
+        type: CI
+        spec:
+          cloneCodebase: true
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: minikube
+              namespace: test
+              automountServiceAccountToken: true
+              os: Linux
+          execution:
+            steps:
+              - step:
+                  name: Deploy TG
+                  identifier: deploy_tg
+                  type: Run
+                  spec:
+                    connectorRef: account.Docker
+                    image: amazon/aws-cli
+                    shell: Sh
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("account.AWS_ACCESS_KEY_ID")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("account.AWS_SECRET_ACCESS_KEY")>
+                      AWS_DEFAULT_REGION: <+pipeline.variables.AWS_DEFAULT_REGION>
+                      VPC_ID: <+pipeline.variables.VPC_ID>
+                    command: |-
+                      aws cloudformation deploy \
+                        --template-file "Target Group/tg.yml" \
+                        --stack-name tg-stack \
+                        --region "$AWS_DEFAULT_REGION" \
+                        --capabilities CAPABILITY_NAMED_IAM \
+                        --parameter-overrides VpcId=$VPC_ID
+    - stage:
+        name: CreateALB
+        identifier: CreateALB
+        type: CI
+        dependsOn:
+          - CreateTargetGroup
+        spec:
+          cloneCodebase: true
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: minikube
+              namespace: test
+              automountServiceAccountToken: true
+              os: Linux
+          execution:
+            steps:
+              - step:
+                  name: Debug Vars
+                  identifier: debug_vars
+                  type: Run
+                  spec:
+                    connectorRef: account.Docker
+                    image: amazon/aws-cli
+                    shell: Sh
+                    command: |-
+                      echo "REGION = $AWS_DEFAULT_REGION"
+                      echo "VPC_ID = $VPC_ID"
+                      echo "SUBNET_IDS = $SUBNET_IDS"
+                      echo "ALB_SG_ID = $ALB_SG_ID"
+              - step:
+                  name: Deploy ALB
+                  identifier: deploy_alb
+                  type: Run
+                  spec:
+                    connectorRef: account.Docker
+                    image: amazon/aws-cli
+                    shell: Sh
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("account.AWS_ACCESS_KEY_ID")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("account.AWS_SECRET_ACCESS_KEY")>
+                      AWS_DEFAULT_REGION: <+pipeline.variables.AWS_DEFAULT_REGION>
+                      VPC_ID: <+pipeline.variables.VPC_ID>
+                      SUBNET_IDS: <+pipeline.variables.SUBNET_IDS>
+                      ALB_SG_ID: <+pipeline.variables.ALB_SG_ID>
+                    command: |-
+                      aws cloudformation deploy \
+                        --template-file "Application Load Balancer/alb.yml" \
+                        --stack-name alb-stack \
+                        --region "$AWS_DEFAULT_REGION" \
+                        --capabilities CAPABILITY_NAMED_IAM \
+                        --parameter-overrides \
+                          VpcId=$VPC_ID \
+                          SubnetIds=$SUBNET_IDS \
+                          AlbSecurityGroupId=$ALB_SG_ID
+    - stage:
+        name: CreateListener
+        identifier: CreateListener
+        type: CI
+        dependsOn:
+          - CreateALB
+        spec:
+          cloneCodebase: true
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: minikube
+              namespace: test
+              automountServiceAccountToken: true
+              os: Linux
+          execution:
+            steps:
+              - step:
+                  name: Deploy Listener
+                  identifier: deploy_listener
+                  type: Run
+                  spec:
+                    connectorRef: account.Docker
+                    image: amazon/aws-cli
+                    shell: Sh
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("account.AWS_ACCESS_KEY_ID")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("account.AWS_SECRET_ACCESS_KEY")>
+                      AWS_DEFAULT_REGION: <+pipeline.variables.AWS_DEFAULT_REGION>
+                    command: |-
+                      TG_ARN=$(aws cloudformation describe-stacks \
+                        --stack-name tg-stack \
+                        --region "$AWS_DEFAULT_REGION" \
+                        --query "Stacks[0].Outputs[?ExportName=='tg-stack-TgArn'].OutputValue" \
+                        --output text)
+
+                      LB_ARN=$(aws cloudformation describe-stacks \
+                        --stack-name alb-stack \
+                        --region "$AWS_DEFAULT_REGION" \
+                        --query "Stacks[0].Outputs[?ExportName=='alb-stack-AlbArn'].OutputValue" \
+                        --output text)
+
+                      aws cloudformation deploy \
+                        --template-file "Listner/listner.yml" \
+                        --stack-name listener-stack \
+                        --region "$AWS_DEFAULT_REGION" \
+                        --capabilities CAPABILITY_NAMED_IAM \
+                        --parameter-overrides LoadBalancerArn=$LB_ARN TargetGroupArn=$TG_ARN
+    - stage:
+        name: CreateECSCluster
+        identifier: CreateECSCluster
+        type: CI
+        dependsOn:
+          - CreateListener
+        spec:
+          cloneCodebase: true
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: minikube
+              namespace: test
+              automountServiceAccountToken: true
+              os: Linux
+          execution:
+            steps:
+              - step:
+                  name: Deploy ECS Cluster
+                  identifier: deploy_ecs
+                  type: Run
+                  spec:
+                    connectorRef: account.Docker
+                    image: amazon/aws-cli
+                    shell: Sh
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("account.AWS_ACCESS_KEY_ID")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("account.AWS_SECRET_ACCESS_KEY")>
+                      AWS_DEFAULT_REGION: <+pipeline.variables.AWS_DEFAULT_REGION>
+                    command: |-
+                      aws cloudformation deploy \
+                        --template-file "ECS/ecs.yml" \
+                        --stack-name ecs-cluster-stack \
+                        --region "$AWS_DEFAULT_REGION" \
+                        --capabilities CAPABILITY_NAMED_IAM
+    - stage:
+        name: RegisterTaskDefinition
+        identifier: RegisterTaskDefinition
+        type: CI
+        dependsOn:
+          - CreateECSCluster
+        spec:
+          cloneCodebase: false
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: minikube
+              namespace: test
+              automountServiceAccountToken: true
+              os: Linux
+          execution:
+            steps:
+              - step:
+                  name: Register Task Def
+                  identifier: register_task
+                  type: Run
+                  spec:
+                    connectorRef: account.Docker
+                    image: amazon/aws-cli
+                    shell: Sh
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("account.AWS_ACCESS_KEY_ID")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("account.AWS_SECRET_ACCESS_KEY")>
+                      AWS_DEFAULT_REGION: <+pipeline.variables.AWS_DEFAULT_REGION>
+                      TASK_IMAGE: <+pipeline.variables.TASK_IMAGE>
+                    command: |-
+                      aws ecs register-task-definition \
+                        --family fd-backend-task \
+                        --requires-compatibilities FARGATE \
+                        --network-mode awsvpc \
+                        --cpu "256" \
+                        --memory "512" \
+                        --execution-role-arn arn:aws:iam::841807079140:role/ecsTaskExecutionRole \
+                        --container-definitions "[
+                          {
+                            \"name\": \"fd-backend\",
+                            \"image\": \"$TASK_IMAGE\",
+                            \"essential\": true,
+                            \"portMappings\": [
+                              {
+                                \"containerPort\": 3000,
+                                \"hostPort\": 3000,
+                                \"protocol\": \"tcp\"
+                              }
+                            ]
+                          }
+                        ]"
+    - stage:
+        name: CreateECSService
+        identifier: CreateECSService
+        type: CI
+        dependsOn:
+          - RegisterTaskDefinition
+        spec:
+          cloneCodebase: false
+          infrastructure:
+            type: KubernetesDirect
+            spec:
+              connectorRef: minikube
+              namespace: test
+              automountServiceAccountToken: true
+              os: Linux
+          execution:
+            steps:
+              - step:
+                  name: Create ECS Service
+                  identifier: create_ecs_service
+                  type: Run
+                  spec:
+                    connectorRef: account.Docker
+                    image: amazon/aws-cli
+                    shell: Sh
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("account.AWS_ACCESS_KEY_ID")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("account.AWS_SECRET_ACCESS_KEY")>
+                      AWS_DEFAULT_REGION: <+pipeline.variables.AWS_DEFAULT_REGION>
+                      CREATE_SERVICE: <+pipeline.variables.CREATE_SERVICE>
+                      SUBNET_IDS: <+pipeline.variables.SUBNET_IDS>
+                      ALB_SG_ID: <+pipeline.variables.ALB_SG_ID>
+                    command: |-
+                      if [ "$CREATE_SERVICE" = "true" ]; then
+                        aws ecs create-service \
+                          --cluster default \
+                          --service-name fd-backend-service \
+                          --task-definition fd-backend-task \
+                          --desired-count 1 \
+                          --launch-type FARGATE \
+                          --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_IDS],securityGroups=[$ALB_SG_ID],assignPublicIp=ENABLED}"
+                      else
+                        echo "Skipping ECS service creation as per input flag."
